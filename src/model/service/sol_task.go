@@ -325,7 +325,15 @@ func resolveSolanaRpcNode(excludeIDs ...uint64) (*mdb.RpcNode, error) {
 }
 
 // SolRetryClient 发送 Solana JSON-RPC 请求，自动重试
-func SolRetryClient(method string, params []interface{}) ([]byte, error) {
+func SolRetryClient(method string, params []interface{}) (body []byte, err error) {
+	defer func() {
+		if err != nil {
+			data.RecordRpcFailure(mdb.NetworkSolana)
+			return
+		}
+		data.RecordRpcSuccess(mdb.NetworkSolana)
+	}()
+
 	tried := make([]uint64, 0, 3)
 	var lastErr error
 	for attempts := 0; attempts < 3; attempts++ {
@@ -441,6 +449,32 @@ func SolGetSignaturesForAddress(address string, limit int, untilSig string, befo
 	}
 
 	return bodyData, nil
+}
+
+func SolGetBlockHeight() (height int64, err error) {
+	defer func() {
+		if err != nil {
+			data.RecordRpcFailure(mdb.NetworkSolana)
+			return
+		}
+		data.RecordRpcSuccess(mdb.NetworkSolana)
+	}()
+
+	rpcURL, err := resolveSolanaRpcURL()
+	if err != nil {
+		return 0, err
+	}
+	bodyData, err := solRetryClientWithURL(rpcURL, "getBlockHeight", []interface{}{
+		map[string]interface{}{"commitment": "finalized"},
+	})
+	if err != nil {
+		return 0, err
+	}
+	height = gjson.GetBytes(bodyData, "result").Int()
+	if height <= 0 {
+		return 0, fmt.Errorf("unexpected getBlockHeight response: %s", string(bodyData))
+	}
+	return height, nil
 }
 
 func SolGetTransaction(sig string) ([]byte, error) {

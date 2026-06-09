@@ -76,7 +76,7 @@ func runPolygonListener(contracts []common.Address) {
 		Topics:    [][]common.Hash{},
 	}
 
-	runEvmWsLogListener(ctx, "[POLYGON-WS]", wsNode, query, func(client *ethclient.Client, vLog types.Log) {
+	runEvmWsLogListener(ctx, mdb.NetworkPolygon, "[POLYGON-WS]", wsNode, query, func(client *ethclient.Client, vLog types.Log) {
 		if len(vLog.Topics) < 3 {
 			return
 		}
@@ -97,9 +97,11 @@ func runPolygonListener(contracts []common.Address) {
 		var blockTsMs int64
 		header, err := client.HeaderByNumber(context.Background(), big.NewInt(int64(vLog.BlockNumber)))
 		if err != nil {
+			data.RecordRpcFailure(mdb.NetworkPolygon)
 			log.Sugar.Warnf("[POLYGON-WS] HeaderByNumber block=%d: %v, using local time", vLog.BlockNumber, err)
 			blockTsMs = time.Now().UnixMilli()
 		} else {
+			data.RecordRpcSuccess(mdb.NetworkPolygon)
 			blockTsMs = int64(header.Time) * 1000
 		}
 

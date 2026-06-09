@@ -269,6 +269,7 @@ func registerAdminRoutes(e *echo.Echo) {
 	authed.GET("/dashboard/asset-trend", admin.Ctrl.AssetTrend)
 	authed.GET("/dashboard/revenue-trend", admin.Ctrl.RevenueTrend)
 	authed.GET("/dashboard/order-stats", admin.Ctrl.OrderStats)
+	authed.GET("/dashboard/rpc-stats", admin.Ctrl.RpcStats)
 	authed.GET("/dashboard/recent-orders", admin.Ctrl.RecentOrders)
 
 	// Settings

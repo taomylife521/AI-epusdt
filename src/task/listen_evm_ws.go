@@ -14,12 +14,17 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
+const (
+	evmStatsIdleInterval  = 30 * time.Second
+	evmStatsHeaderTimeout = 10 * time.Second
+)
+
 // runEvmWsLogListener connects to node.Url, subscribes to Transfer logs,
 // and dispatches each log to handleLog. It retries on transient errors
 // with exponential backoff until the node reaches the failure threshold.
 // The ctx lets the caller trigger a clean exit — e.g. when admin disables
 // the chain, the caller cancels the context and the function returns.
-func runEvmWsLogListener(ctx context.Context, logPrefix string, node mdb.RpcNode, query ethereum.FilterQuery, handleLog func(*ethclient.Client, types.Log)) {
+func runEvmWsLogListener(ctx context.Context, network string, logPrefix string, node mdb.RpcNode, query ethereum.FilterQuery, handleLog func(*ethclient.Client, types.Log)) {
 	const (
 		minBackoff       = 2 * time.Second
 		maxBackoff       = 60 * time.Second
@@ -37,8 +42,11 @@ func runEvmWsLogListener(ctx context.Context, logPrefix string, node mdb.RpcNode
 
 		client, err := ethclient.Dial(wsURL)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Sugar.Warnf("%s dial: %v, retry in %s", logPrefix, err, failWait)
-			if recordEvmWsNodeFailure(logPrefix, node, "dial") {
+			if recordEvmWsNodeFailure(logPrefix, network, node, "dial") {
 				return
 			}
 			if !sleepOrDone(ctx, failWait) {
@@ -52,8 +60,11 @@ func runEvmWsLogListener(ctx context.Context, logPrefix string, node mdb.RpcNode
 		sub, err := client.SubscribeFilterLogs(ctx, query, logsCh)
 		if err != nil {
 			client.Close()
+			if ctx.Err() != nil {
+				return
+			}
 			log.Sugar.Warnf("%s subscribe: %v, retry in %s", logPrefix, err, failWait)
-			if recordEvmWsNodeFailure(logPrefix, node, "subscribe") {
+			if recordEvmWsNodeFailure(logPrefix, network, node, "subscribe") {
 				return
 			}
 			if !sleepOrDone(ctx, failWait) {
@@ -63,18 +74,22 @@ func runEvmWsLogListener(ctx context.Context, logPrefix string, node mdb.RpcNode
 			continue
 		}
 		failWait = minBackoff
+		data.RecordRpcSuccess(network)
 
 		log.Sugar.Infof("%s connected, subscribed to Transfer logs using WSS node %s", logPrefix, nodeLabel)
 
 		connectedAt := time.Now()
-		recvErr := recvLoop(ctx, client, sub, logsCh, logPrefix, handleLog)
+		recvErr := recvLoop(ctx, client, sub, logsCh, network, logPrefix, handleLog)
 
 		if ctx.Err() != nil {
 			return
 		}
 		if time.Since(connectedAt) >= stableResetAfter {
+			if recvErr != nil {
+				data.RecordRpcFailure(network)
+			}
 			data.RecordRpcNodeSuccess(node.ID)
-		} else if recvErr != nil && recordEvmWsNodeFailure(logPrefix, node, recvErr.Error()) {
+		} else if recvErr != nil && recordEvmWsNodeFailure(logPrefix, network, node, recvErr.Error()) {
 			return
 		}
 		if !sleepOrDone(ctx, rejoinWait) {
@@ -83,8 +98,25 @@ func runEvmWsLogListener(ctx context.Context, logPrefix string, node mdb.RpcNode
 	}
 }
 
-func recvLoop(ctx context.Context, client *ethclient.Client, sub ethereum.Subscription, logsCh <-chan types.Log, logPrefix string, handleLog func(*ethclient.Client, types.Log)) error {
+func recvLoop(ctx context.Context, client *ethclient.Client, sub ethereum.Subscription, logsCh <-chan types.Log, network string, logPrefix string, handleLog func(*ethclient.Client, types.Log)) error {
+	statsCtx, cancelStats := context.WithCancel(ctx)
+	statsTicker := time.NewTicker(evmStatsIdleInterval)
+	headerStatsDone := make(chan bool, 1)
+	lastStatsUpdateAt := time.Now()
+	headerStatsInFlight := false
+	requestLatestHeader := func() {
+		if headerStatsInFlight {
+			return
+		}
+		headerStatsInFlight = true
+		go func() {
+			headerStatsDone <- recordEvmLatestHeader(statsCtx, network, logPrefix, client)
+		}()
+	}
+
 	defer func() {
+		cancelStats()
+		statsTicker.Stop()
 		sub.Unsubscribe()
 		client.Close()
 	}()
@@ -94,6 +126,15 @@ func recvLoop(ctx context.Context, client *ethclient.Client, sub ethereum.Subscr
 		case <-ctx.Done():
 			log.Sugar.Infof("%s context cancelled, stopping", logPrefix)
 			return nil
+		case <-statsTicker.C:
+			if shouldRefreshEvmLatestHeader(lastStatsUpdateAt, headerStatsInFlight, time.Now()) {
+				requestLatestHeader()
+			}
+		case updated := <-headerStatsDone:
+			headerStatsInFlight = false
+			if updated {
+				lastStatsUpdateAt = time.Now()
+			}
 		case err := <-sub.Err():
 			if err != nil {
 				log.Sugar.Warnf("%s subscription error: %v, reconnecting", logPrefix, err)
@@ -107,12 +148,61 @@ func recvLoop(ctx context.Context, client *ethclient.Client, sub ethereum.Subscr
 				log.Sugar.Warnf("%s log channel closed, reconnecting", logPrefix)
 				return fmt.Errorf("log channel closed")
 			}
+			if recordEvmLogBlockHeight(network, logPrefix, vLog.BlockNumber) {
+				lastStatsUpdateAt = time.Now()
+			}
 			handleLog(client, vLog)
 		}
 	}
 }
 
-func recordEvmWsNodeFailure(logPrefix string, node mdb.RpcNode, reason string) bool {
+func shouldRefreshEvmLatestHeader(lastStatsUpdateAt time.Time, inFlight bool, now time.Time) bool {
+	return !inFlight && now.Sub(lastStatsUpdateAt) >= evmStatsIdleInterval
+}
+
+func recordEvmLogBlockHeight(network string, logPrefix string, blockNumber uint64) bool {
+	if blockNumber == 0 {
+		return false
+	}
+	if blockNumber > uint64(1<<63-1) {
+		log.Sugar.Warnf("%s log block number exceeds int64 range: %d", logPrefix, blockNumber)
+		return false
+	}
+	data.RecordRpcBlockHeight(network, int64(blockNumber))
+	return true
+}
+
+func recordEvmLatestHeader(ctx context.Context, network string, logPrefix string, client *ethclient.Client) bool {
+	headerCtx, cancel := context.WithTimeout(ctx, evmStatsHeaderTimeout)
+	defer cancel()
+
+	header, err := client.HeaderByNumber(headerCtx, nil)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false
+		}
+		data.RecordRpcFailure(network)
+		log.Sugar.Warnf("%s latest header stats failed: %v", logPrefix, err)
+		return false
+	}
+	data.RecordRpcSuccess(network)
+	return recordEvmHeaderBlockHeight(network, logPrefix, header)
+}
+
+func recordEvmHeaderBlockHeight(network string, logPrefix string, header *types.Header) bool {
+	if header == nil || header.Number == nil {
+		return false
+	}
+	if !header.Number.IsInt64() {
+		log.Sugar.Warnf("%s latest header block number exceeds int64 range: %s", logPrefix, header.Number.String())
+		return false
+	}
+	data.RecordRpcBlockHeight(network, header.Number.Int64())
+	return true
+}
+
+func recordEvmWsNodeFailure(logPrefix string, network string, node mdb.RpcNode, reason string) bool {
+	data.RecordRpcFailure(network)
 	failures, cooling := data.RecordRpcNodeFailure(node.ID)
 	nodeLabel := data.RpcNodeLogLabel(node)
 	if !cooling {

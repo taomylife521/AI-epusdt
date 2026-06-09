@@ -1,6 +1,8 @@
 package route
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -230,6 +232,7 @@ func TestAdminProtectedRoute_NoToken(t *testing.T) {
 		"/admin/api/v1/wallets",
 		"/admin/api/v1/orders",
 		"/admin/api/v1/dashboard/overview",
+		"/admin/api/v1/dashboard/rpc-stats",
 		"/admin/api/v1/settings",
 		"/admin/api/v1/rpc-nodes",
 		"/admin/api/v1/notification-channels",
@@ -971,7 +974,7 @@ func TestAdminOrders_ResendCallbackRequeuesPaidOrder(t *testing.T) {
 
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 
-// TestAdminDashboard_AllRoutes verifies all dashboard endpoints return 200.
+// TestAdminDashboard_AllRoutes verifies ordinary JSON dashboard endpoints return 200.
 func TestAdminDashboard_AllRoutes(t *testing.T) {
 	e, token := setupAdminTestEnv(t)
 	routes := []string{
@@ -985,6 +988,148 @@ func TestAdminDashboard_AllRoutes(t *testing.T) {
 		rec := doGetAdmin(e, path, token)
 		t.Logf("GET %s → %d: %s", path, rec.Code, rec.Body.String())
 		assertOK(t, rec)
+	}
+}
+
+func TestAdminDashboardRpcStatsSSE(t *testing.T) {
+	e, token := setupAdminTestEnv(t)
+	data.RecordRpcSuccess("TRON")
+	data.RecordRpcSuccess("tron")
+	data.RecordRpcFailure(" tron ")
+	data.RecordRpcBlockHeight("tron", 64532100)
+
+	server := httptest.NewServer(e)
+	defer server.Close()
+
+	reqCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, server.URL+"/admin/api/v1/dashboard/rpc-stats", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set(echo.HeaderAuthorization, "Bearer "+token)
+	req.Header.Set(echo.HeaderAccept, "text/event-stream")
+
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("sse request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sse status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get(echo.HeaderContentType); !strings.Contains(ct, "text/event-stream") {
+		t.Fatalf("content-type = %q, want text/event-stream", ct)
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	var eventName string
+	var dataLine string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read sse line: %v", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(line, "event: ") {
+			eventName = strings.TrimPrefix(line, "event: ")
+		}
+		if strings.HasPrefix(line, "data: ") {
+			dataLine = strings.TrimPrefix(line, "data: ")
+		}
+		if line == "" && dataLine != "" {
+			break
+		}
+	}
+	if eventName != "rpc_stats" {
+		t.Fatalf("event = %q, want rpc_stats", eventName)
+	}
+
+	var envelope map[string]interface{}
+	if err := json.Unmarshal([]byte(dataLine), &envelope); err != nil {
+		t.Fatalf("unmarshal sse data: %v data=%s", err, dataLine)
+	}
+	if got, _ := envelope["status_code"].(float64); got != 200 {
+		t.Fatalf("sse status_code = %v, want 200", got)
+	}
+	dataObj, ok := envelope["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("sse data = %#v, want object", envelope["data"])
+	}
+	rows, ok := dataObj["chains"].([]interface{})
+	if !ok {
+		t.Fatalf("sse chains = %#v, want array", dataObj["chains"])
+	}
+
+	summary, ok := dataObj["summary"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("summary = %#v, want object", dataObj["summary"])
+	}
+	if got, _ := summary["success_count"].(float64); got != 2 {
+		t.Fatalf("summary success_count = %v, want 2", got)
+	}
+	if got, _ := summary["failure_count"].(float64); got != 1 {
+		t.Fatalf("summary failure_count = %v, want 1", got)
+	}
+	if got, _ := summary["success_rate"].(float64); got < 0.666 || got > 0.667 {
+		t.Fatalf("summary success_rate = %v, want about 0.6667", got)
+	}
+
+	var tron map[string]interface{}
+	var solana map[string]interface{}
+	for _, row := range rows {
+		item, _ := row.(map[string]interface{})
+		switch item["network"] {
+		case mdb.NetworkTron:
+			tron = item
+		case mdb.NetworkSolana:
+			solana = item
+		}
+	}
+	if tron == nil {
+		t.Fatalf("missing tron row in %#v", rows)
+	}
+	if got, _ := tron["success_count"].(float64); got != 2 {
+		t.Fatalf("tron success_count = %v, want 2", got)
+	}
+	if got, _ := tron["failure_count"].(float64); got != 1 {
+		t.Fatalf("tron failure_count = %v, want 1", got)
+	}
+	if got, _ := tron["success_rate"].(float64); got < 0.666 || got > 0.667 {
+		t.Fatalf("tron success_rate = %v, want about 0.6667", got)
+	}
+	if got, _ := tron["latest_block_height"].(float64); got != 64532100 {
+		t.Fatalf("tron latest_block_height = %v, want 64532100", got)
+	}
+	if got, _ := tron["last_sync_at"].(string); got == "" {
+		t.Fatalf("tron last_sync_at is empty: %#v", tron)
+	}
+	if got, _ := tron["display_name"].(string); got != "TRON" {
+		t.Fatalf("tron display_name = %q, want TRON", got)
+	}
+	if got, _ := tron["status"].(string); got != "warning" {
+		t.Fatalf("tron status = %q, want warning", got)
+	}
+	if solana == nil {
+		t.Fatalf("missing solana row in %#v", rows)
+	}
+	if got, _ := solana["success_count"].(float64); got != 0 {
+		t.Fatalf("solana success_count = %v, want 0", got)
+	}
+	if got, _ := solana["failure_count"].(float64); got != 0 {
+		t.Fatalf("solana failure_count = %v, want 0", got)
+	}
+	if got, _ := solana["success_rate"].(float64); got != 0 {
+		t.Fatalf("solana success_rate = %v, want 0", got)
+	}
+	if got, _ := solana["last_sync_at"].(string); got != "" {
+		t.Fatalf("solana last_sync_at = %q, want empty", got)
+	}
+	if got, _ := solana["latest_block_height"].(float64); got != 0 {
+		t.Fatalf("solana latest_block_height = %v, want 0", got)
+	}
+	if got, _ := solana["status"].(string); got != "unknown" {
+		t.Fatalf("solana status = %q, want unknown", got)
 	}
 }
 

@@ -82,7 +82,7 @@ func runEthereumListener(contracts []common.Address) {
 		Topics:    [][]common.Hash{},
 	}
 
-	runEvmWsLogListener(ctx, "[ETH-WS]", wsNode, query, func(client *ethclient.Client, vLog types.Log) {
+	runEvmWsLogListener(ctx, mdb.NetworkEthereum, "[ETH-WS]", wsNode, query, func(client *ethclient.Client, vLog types.Log) {
 		if len(vLog.Topics) < 3 {
 			return
 		}
@@ -100,9 +100,11 @@ func runEthereumListener(contracts []common.Address) {
 		var blockTsMs int64
 		header, err := client.HeaderByNumber(context.Background(), big.NewInt(int64(vLog.BlockNumber)))
 		if err != nil {
+			data.RecordRpcFailure(mdb.NetworkEthereum)
 			log.Sugar.Warnf("[ETH-WS] HeaderByNumber block=%d: %v, using local time", vLog.BlockNumber, err)
 			blockTsMs = time.Now().UnixMilli()
 		} else {
+			data.RecordRpcSuccess(mdb.NetworkEthereum)
 			blockTsMs = int64(header.Time) * 1000
 		}
 

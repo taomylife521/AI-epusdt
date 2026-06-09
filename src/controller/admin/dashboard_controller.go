@@ -1,6 +1,9 @@
 package admin
 
 import (
+	"encoding/json"
+	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +30,49 @@ type OrderStatsResponse struct {
 	SuccessRate        float64 `json:"success_rate" example:"0.85"`
 	AvgPaymentSeconds  float64 `json:"avg_payment_seconds" example:"120.5"`
 	ExpiredUnpaidCount int64   `json:"expired_unpaid_count" example:"10"`
+}
+
+// RpcStatsDashboardResponse is the RPC runtime stats payload.
+type RpcStatsDashboardResponse struct {
+	GeneratedAt string                  `json:"generated_at" example:"2026-06-09T12:00:00+08:00"`
+	Summary     RpcStatsSummaryResponse `json:"summary"`
+	Chains      []RpcStatsChainResponse `json:"chains"`
+}
+
+// RpcStatsSummaryResponse is the overall RPC runtime summary.
+type RpcStatsSummaryResponse struct {
+	TotalChains    int     `json:"total_chains" example:"6"`
+	EnabledChains  int     `json:"enabled_chains" example:"5"`
+	ActiveChains   int     `json:"active_chains" example:"4"`
+	OkChains       int     `json:"ok_chains" example:"3"`
+	WarningChains  int     `json:"warning_chains" example:"1"`
+	DownChains     int     `json:"down_chains" example:"0"`
+	UnknownChains  int     `json:"unknown_chains" example:"1"`
+	DisabledChains int     `json:"disabled_chains" example:"1"`
+	SuccessCount   int64   `json:"success_count" example:"123"`
+	FailureCount   int64   `json:"failure_count" example:"2"`
+	SuccessRate    float64 `json:"success_rate" example:"0.984"`
+}
+
+// RpcStatsChainResponse is one chain's in-process RPC runtime stats.
+type RpcStatsChainResponse struct {
+	Network           string  `json:"network" example:"tron"`
+	DisplayName       string  `json:"display_name" example:"TRON"`
+	Enabled           bool    `json:"enabled" example:"true"`
+	HasData           bool    `json:"has_data" example:"true"`
+	Status            string  `json:"status" example:"ok" enums:"ok,warning,down,unknown,disabled"`
+	SuccessCount      int64   `json:"success_count" example:"123"`
+	FailureCount      int64   `json:"failure_count" example:"2"`
+	SuccessRate       float64 `json:"success_rate" example:"0.984"`
+	LatestBlockHeight int64   `json:"latest_block_height" example:"64532100"`
+	LastSyncAt        string  `json:"last_sync_at" example:"2026-06-09T12:00:00+08:00"`
+}
+
+type rpcStatsStreamEnvelope struct {
+	StatusCode int                       `json:"status_code"`
+	Message    string                    `json:"message"`
+	Data       RpcStatsDashboardResponse `json:"data"`
+	RequestID  string                    `json:"request_id"`
 }
 
 // RpcHealthCheckResponse is the response for a health check probe.
@@ -228,6 +274,174 @@ func (c *BaseAdminController) OrderStats(ctx echo.Context) error {
 		"avg_payment_seconds":  avg,
 		"expired_unpaid_count": expired,
 	})
+}
+
+// RpcStats returns process-local RPC runtime counters grouped by chain.
+// Values reset on process restart and are not persisted to the database.
+// @Summary      RPC runtime statistics
+// @Description  Streams in-process RPC success/failure counts, success rate, latest block height and last sync time by chain over one authenticated SSE connection.
+// @Tags         Admin Dashboard
+// @Security     AdminJWT
+// @Produce      text/event-stream
+// @Success      200 {object} response.ApiResponse{data=admin.RpcStatsDashboardResponse}
+// @Failure      400 {object} response.ApiResponse
+// @Router       /admin/api/v1/dashboard/rpc-stats [get]
+func (c *BaseAdminController) RpcStats(ctx echo.Context) error {
+	return c.streamRpcStats(ctx)
+}
+
+func buildRpcStatsResponse() (RpcStatsDashboardResponse, error) {
+	chains, err := data.ListChains()
+	if err != nil {
+		return RpcStatsDashboardResponse{}, err
+	}
+	stats := data.SnapshotRpcRuntimeStats()
+	now := time.Now()
+	resp := RpcStatsDashboardResponse{
+		GeneratedAt: now.Format(time.RFC3339),
+		Chains:      make([]RpcStatsChainResponse, 0, len(chains)),
+	}
+	for _, chain := range chains {
+		network := strings.ToLower(strings.TrimSpace(chain.Network))
+		stat := stats[network]
+		successRate := rpcStatsSuccessRate(stat.SuccessCount, stat.FailureCount)
+		hasData := stat.SuccessCount+stat.FailureCount > 0
+		status := rpcStatsStatus(chain.Enabled, stat.SuccessCount, stat.FailureCount)
+		lastSyncAt := ""
+		if !stat.LastSyncAt.IsZero() {
+			lastSyncAt = stat.LastSyncAt.Format(time.RFC3339)
+		}
+
+		resp.Summary.TotalChains++
+		if chain.Enabled {
+			resp.Summary.EnabledChains++
+		}
+		if hasData {
+			resp.Summary.ActiveChains++
+		}
+		switch status {
+		case "ok":
+			resp.Summary.OkChains++
+		case "warning":
+			resp.Summary.WarningChains++
+		case "down":
+			resp.Summary.DownChains++
+		case "disabled":
+			resp.Summary.DisabledChains++
+		default:
+			resp.Summary.UnknownChains++
+		}
+		resp.Summary.SuccessCount += stat.SuccessCount
+		resp.Summary.FailureCount += stat.FailureCount
+
+		resp.Chains = append(resp.Chains, RpcStatsChainResponse{
+			Network:           chain.Network,
+			DisplayName:       rpcStatsDisplayName(chain.Network, chain.DisplayName),
+			Enabled:           chain.Enabled,
+			HasData:           hasData,
+			Status:            status,
+			SuccessCount:      stat.SuccessCount,
+			FailureCount:      stat.FailureCount,
+			SuccessRate:       successRate,
+			LatestBlockHeight: stat.LatestBlockHeight,
+			LastSyncAt:        lastSyncAt,
+		})
+	}
+	resp.Summary.SuccessRate = rpcStatsSuccessRate(resp.Summary.SuccessCount, resp.Summary.FailureCount)
+	return resp, nil
+}
+
+func (c *BaseAdminController) streamRpcStats(ctx echo.Context) error {
+	initial, err := buildRpcStatsResponse()
+	if err != nil {
+		return c.FailJson(ctx, err)
+	}
+
+	resp := ctx.Response()
+	resp.Header().Set(echo.HeaderContentType, "text/event-stream; charset=utf-8")
+	resp.Header().Set("Cache-Control", "no-cache")
+	resp.Header().Set("Connection", "keep-alive")
+	resp.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := resp.Writer.(http.Flusher)
+	if !ok {
+		return echo.NewHTTPError(http.StatusInternalServerError, "streaming unsupported")
+	}
+
+	resp.WriteHeader(http.StatusOK)
+	if _, err := fmt.Fprint(resp.Writer, "retry: 5000\n\n"); err != nil {
+		return err
+	}
+	if err := writeRpcStatsSSE(ctx, flusher, initial); err != nil {
+		return err
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Request().Context().Done():
+			return nil
+		case <-ticker.C:
+			payload, err := buildRpcStatsResponse()
+			if err != nil {
+				return err
+			}
+			if err := writeRpcStatsSSE(ctx, flusher, payload); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func writeRpcStatsSSE(ctx echo.Context, flusher http.Flusher, payload RpcStatsDashboardResponse) error {
+	envelope := rpcStatsStreamEnvelope{
+		StatusCode: http.StatusOK,
+		Message:    "success",
+		Data:       payload,
+		RequestID:  ctx.Request().Header.Get(echo.HeaderXRequestID),
+	}
+	b, err := json.Marshal(envelope)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(ctx.Response().Writer, "event: rpc_stats\ndata: %s\n\n", b); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func rpcStatsDisplayName(network string, displayName string) string {
+	if name := strings.TrimSpace(displayName); name != "" {
+		return name
+	}
+	return strings.TrimSpace(network)
+}
+
+func rpcStatsSuccessRate(successCount, failureCount int64) float64 {
+	total := successCount + failureCount
+	if total <= 0 {
+		return 0
+	}
+	return float64(successCount) / float64(total)
+}
+
+func rpcStatsStatus(enabled bool, successCount, failureCount int64) string {
+	if !enabled {
+		return "disabled"
+	}
+	if successCount+failureCount == 0 {
+		return "unknown"
+	}
+	if successCount == 0 {
+		return "down"
+	}
+	if failureCount > 0 {
+		return "warning"
+	}
+	return "ok"
 }
 
 // RecentOrders returns the last N orders for the dashboard list card.

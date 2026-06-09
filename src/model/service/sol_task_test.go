@@ -102,6 +102,53 @@ func TestResolveSolanaRpcURLUsesGeneralWhenManualVerifyExists(t *testing.T) {
 	}
 }
 
+func TestSolGetBlockHeightDoesNotAffectRpcNodeFailover(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+	data.ResetRpcFailoverForTest()
+	data.ResetRpcRuntimeStatsForTest()
+	t.Cleanup(data.ResetRpcFailoverForTest)
+	t.Cleanup(data.ResetRpcRuntimeStatsForTest)
+
+	oldRetryCount := solRPCRetryCount
+	solRPCRetryCount = 0
+	t.Cleanup(func() {
+		solRPCRetryCount = oldRetryCount
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "temporary", http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	node := &mdb.RpcNode{
+		Network: mdb.NetworkSolana,
+		Url:     server.URL,
+		Type:    mdb.RpcNodeTypeHttp,
+		Weight:  1,
+		Enabled: true,
+		Purpose: mdb.RpcNodePurposeGeneral,
+		Status:  mdb.RpcNodeStatusOk,
+	}
+	if err := dao.Mdb.Create(node).Error; err != nil {
+		t.Fatalf("seed solana rpc_node: %v", err)
+	}
+
+	for i := 0; i < data.RpcFailoverThreshold+1; i++ {
+		if _, err := SolGetBlockHeight(); err == nil {
+			t.Fatalf("SolGetBlockHeight attempt %d unexpectedly succeeded", i+1)
+		}
+	}
+
+	if data.IsRpcNodeCoolingDown(node.ID) {
+		t.Fatal("SolGetBlockHeight failures should not affect rpc_node failover cooldown")
+	}
+	stats := data.SnapshotRpcRuntimeStats()
+	if got := stats[mdb.NetworkSolana].FailureCount; got != int64(data.RpcFailoverThreshold+1) {
+		t.Fatalf("solana runtime failure_count = %d, want %d", got, data.RpcFailoverThreshold+1)
+	}
+}
+
 func TestSolRetryClientSwitchesAfterFailureThreshold(t *testing.T) {
 	cleanup := testutil.SetupTestDatabases(t)
 	defer cleanup()

@@ -1,13 +1,22 @@
 package task
 
 import (
+	"math/big"
 	"testing"
+	"time"
 
 	"github.com/GMWalletApp/epusdt/internal/testutil"
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
+	epLog "github.com/GMWalletApp/epusdt/util/log"
+	"github.com/ethereum/go-ethereum/core/types"
+	"go.uber.org/zap"
 )
+
+func init() {
+	epLog.Sugar = zap.NewNop().Sugar()
+}
 
 func TestResolveChainWsURLRequiresEnabledRpcNode(t *testing.T) {
 	cleanup := testutil.SetupTestDatabases(t)
@@ -113,6 +122,70 @@ func TestResolveChainWsNodeSkipsCoolingNode(t *testing.T) {
 	}
 	if got.Url != "wss://backup-ethereum.example.com" {
 		t.Fatalf("resolveChainWsNode() = %#v, want backup", got)
+	}
+}
+
+func TestEvmWsNodeFailureRecordsRuntimeStats(t *testing.T) {
+	data.ResetRpcFailoverForTest()
+	data.ResetRpcRuntimeStatsForTest()
+	t.Cleanup(data.ResetRpcFailoverForTest)
+	t.Cleanup(data.ResetRpcRuntimeStatsForTest)
+
+	recordEvmWsNodeFailure("[TEST]", mdb.NetworkEthereum, mdb.RpcNode{
+		BaseModel: mdb.BaseModel{ID: 123},
+		Url:       "wss://ethereum.example.com",
+		Type:      mdb.RpcNodeTypeWs,
+	}, "dial")
+
+	stats := data.SnapshotRpcRuntimeStats()
+	eth := stats[mdb.NetworkEthereum]
+	if eth.SuccessCount != 0 {
+		t.Fatalf("ethereum success_count = %d, want 0", eth.SuccessCount)
+	}
+	if eth.FailureCount != 1 {
+		t.Fatalf("ethereum failure_count = %d, want 1", eth.FailureCount)
+	}
+}
+
+func TestEvmLogBlockHeightRecordsRuntimeHeight(t *testing.T) {
+	data.ResetRpcRuntimeStatsForTest()
+	t.Cleanup(data.ResetRpcRuntimeStatsForTest)
+
+	recordEvmLogBlockHeight(mdb.NetworkEthereum, "[TEST]", 123456)
+	recordEvmLogBlockHeight(mdb.NetworkEthereum, "[TEST]", 123455)
+
+	stats := data.SnapshotRpcRuntimeStats()
+	eth := stats[mdb.NetworkEthereum]
+	if eth.LatestBlockHeight != 123456 {
+		t.Fatalf("ethereum latest_block_height = %d, want 123456", eth.LatestBlockHeight)
+	}
+}
+
+func TestEvmHeaderBlockHeightRecordsRuntimeHeight(t *testing.T) {
+	data.ResetRpcRuntimeStatsForTest()
+	t.Cleanup(data.ResetRpcRuntimeStatsForTest)
+
+	recordEvmHeaderBlockHeight(mdb.NetworkPolygon, "[TEST]", &types.Header{Number: big.NewInt(7654321)})
+	recordEvmHeaderBlockHeight(mdb.NetworkPolygon, "[TEST]", &types.Header{Number: big.NewInt(7654320)})
+
+	stats := data.SnapshotRpcRuntimeStats()
+	polygon := stats[mdb.NetworkPolygon]
+	if polygon.LatestBlockHeight != 7654321 {
+		t.Fatalf("polygon latest_block_height = %d, want 7654321", polygon.LatestBlockHeight)
+	}
+}
+
+func TestShouldRefreshEvmLatestHeaderAfterIdleInterval(t *testing.T) {
+	lastUpdate := time.Now()
+
+	if shouldRefreshEvmLatestHeader(lastUpdate, false, lastUpdate.Add(evmStatsIdleInterval-time.Second)) {
+		t.Fatal("should not refresh latest header before idle interval")
+	}
+	if !shouldRefreshEvmLatestHeader(lastUpdate, false, lastUpdate.Add(evmStatsIdleInterval)) {
+		t.Fatal("should refresh latest header at idle interval")
+	}
+	if shouldRefreshEvmLatestHeader(lastUpdate, true, lastUpdate.Add(evmStatsIdleInterval+time.Second)) {
+		t.Fatal("should not refresh latest header while request is in flight")
 	}
 }
 

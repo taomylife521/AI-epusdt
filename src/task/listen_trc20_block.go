@@ -167,19 +167,32 @@ func doPost(url string, apiKey string, body interface{}) ([]byte, error) {
 func GetNowBlock(baseURL string, apiKey string) (*Block, error) {
 	b, err := doPost(baseURL+"/wallet/getnowblock", apiKey, map[string]interface{}{})
 	if err != nil {
+		data.RecordRpcFailure(mdb.NetworkTron)
 		return nil, err
 	}
 	var block Block
-	return &block, json.Unmarshal(b, &block)
+	if err := json.Unmarshal(b, &block); err != nil {
+		data.RecordRpcFailure(mdb.NetworkTron)
+		return nil, err
+	}
+	data.RecordRpcSuccess(mdb.NetworkTron)
+	data.RecordRpcBlockHeight(mdb.NetworkTron, block.BlockHeader.RawData.Number)
+	return &block, nil
 }
 
 func GetBlockByNum(baseURL string, apiKey string, num int64) (*Block, error) {
 	b, err := doPost(baseURL+"/wallet/getblockbynum", apiKey, map[string]interface{}{"num": num})
 	if err != nil {
+		data.RecordRpcFailure(mdb.NetworkTron)
 		return nil, err
 	}
 	var block Block
-	return &block, json.Unmarshal(b, &block)
+	if err := json.Unmarshal(b, &block); err != nil {
+		data.RecordRpcFailure(mdb.NetworkTron)
+		return nil, err
+	}
+	data.RecordRpcSuccess(mdb.NetworkTron)
+	return &block, nil
 }
 
 func loadTronTRC20TokenMap() map[string]mdb.ChainToken {

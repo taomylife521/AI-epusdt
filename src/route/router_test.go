@@ -77,6 +77,7 @@ func setupTestEnv(t *testing.T) *echo.Echo {
 
 	// reset the settings cache so stale entries from a prior test don't leak
 	_ = data.ReloadSettings()
+	data.ResetRpcRuntimeStatsForTest()
 	config.SettingsGetString = func(key string) string {
 		return data.GetSettingString(key, "")
 	}
